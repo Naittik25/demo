@@ -23,7 +23,7 @@
 15. [Mandatory Self-Validation Before Output](#15-mandatory-self-validation-before-output)
 16. [Generic Conversion Example](#16-generic-conversion-example)
 
-**Forbidden Patterns covered:** F.1 PL/SQL procedural blocks · F.2 Explicit cursors · F.3 BULK COLLECT / FORALL · F.4 EXCEPTION blocks · F.5 EXECUTE IMMEDIATE dynamic SQL (+ SQL injection via USING) · F.6 Oracle pseudo-columns · F.7 Oracle functions (NVL, DECODE, etc.) · F.8 Correlated EXISTS in DELETE · F.9 Tuple-SET UPDATE · F.10 IDENTITY / SEQUENCE columns · F.11 Non-deterministic in MERGE ON · F.12 Timestamp format strings · F.13 PRAGMA directives · F.14 DBMS_* package calls · F.15 REF CURSOR · F.16 %TYPE / %ROWTYPE · F.17 Oracle DDL keywords · F.18 Multi-column IN predicate · F.19 PL/SQL Collection types (TABLE OF / VARRAY / INDEX BY) · F.20 FORALL SAVE EXCEPTIONS · F.21 Pipelined Functions (PIPE ROW / PIPELINED)
+**Forbidden Patterns covered:** F.1 PL/SQL procedural blocks · F.2 Explicit cursors · F.3 BULK COLLECT / FORALL · F.4 EXCEPTION blocks · F.5 EXECUTE IMMEDIATE dynamic SQL (+ SQL injection via USING) · F.6 Oracle pseudo-columns · F.7 Oracle functions (NVL, DECODE, etc.) · F.8 Correlated EXISTS in DELETE · F.9 Tuple-SET UPDATE · F.10 IDENTITY / SEQUENCE columns · F.11 Non-deterministic in MERGE ON · F.12 Timestamp format strings · F.13 PRAGMA directives · F.14 DBMS_* package calls · F.15 REF CURSOR · F.16 %TYPE / %ROWTYPE · F.17 Oracle DDL keywords · F.18 Multi-column IN predicate · F.19 PL/SQL Collection types (TABLE OF / VARRAY / INDEX BY) · F.20 FORALL SAVE EXCEPTIONS · F.21 Pipelined Functions (PIPE ROW / PIPELINED) · F.22 MERGE self-reference (target in USING subquery) · F.23 Oracle implicit comma-join / cartesian product trap · F.24 Multiple DML statements in one `%sql` cell · F.25 MERGE / DML into a SQL View
 
 ---
 
@@ -88,6 +88,12 @@ Go through every item. If any item would be violated by your planned code, fix t
 - [ ] No `FORALL … SAVE EXCEPTIONS` — replace with Python per-item `try/except` loop accumulating errors in `bulk_errors` list (see F.20)
 - [ ] No `PIPE ROW`, `PIPELINED`, or `TABLE(fn())` — replace pipelined function with Python function returning a `DataFrame`; use `createOrReplaceTempView` instead of `TABLE(fn())` (see F.21)
 - [ ] No Oracle `OBJECT TYPE` / `TYPE BODY` declarations — replace with Python `@dataclass` and class/instance methods (see Section 11.6)
+- [ ] No MERGE where the USING subquery references the same table as the MERGE target — pre-materialise as `CREATE OR REPLACE TEMPORARY VIEW v_<task>_source` first (see F.22)
+- [ ] No Oracle implicit comma-join (`FROM A, B, C WHERE A.x = B.y`) translated with `ON 1 = 1` — every table pair must have an explicit `JOIN … ON` condition (see F.23)
+- [ ] No `ON 1 = 1` in any JOIN — always a forbidden cross join
+- [ ] Every Oracle `BEGIN … END` with N DML statements → exactly N separate `%sql` cells (see F.24)
+- [ ] No MERGE / UPDATE / INSERT targeting a SQL view (`vw_` prefix) — use the underlying base Delta table (see F.25)
+- [ ] No `NOT IN (subquery)` where the subquery column is nullable — replace with `NOT EXISTS` or `COUNT() OVER (PARTITION BY …)` window dedup (see Rule 4.27)
 - [ ] No `SYS_CONNECT_BY_PATH` — replace with `concat_ws` accumulator column in recursive CTE (see Rule 4.13)
 - [ ] No `CONNECT BY NOCYCLE` — replace with `visited_ids NOT LIKE` cycle guard or depth limit `AND lvl < N` in recursive CTE (see Rule 4.13)
 - [ ] No non-deterministic function (`uuid()`, `rand()`, `monotonically_increasing_id()`) inside any aggregate argument (`COUNT`, `SUM`, `MAX`, `COLLECT_LIST`, etc.) — pre-compute in a staging CTE first (see Step 13)
@@ -871,6 +877,177 @@ transform_orders().write.format("delta").mode("append") \
 
 ---
 
+---
+
+### F.22 — MERGE self-reference (target table also in USING subquery)
+
+**Error:** `DELTA_UNSUPPORTED_OPERATION: The source of a MERGE statement cannot reference the target table.`
+
+This happens when the Oracle source was a correlated `UPDATE … SET … WHERE EXISTS (SELECT … FROM same_table JOIN …)` or when the USING subquery reads from the same table as the MERGE target. Delta Lake forbids this.
+
+```sql
+-- ❌ FORBIDDEN — w_sales_order_line_f is both target and in USING
+MERGE INTO workspace.schema.w_sales_order_line_f AS T
+USING (
+    SELECT A.sales_order_hd_id, B.common
+    FROM workspace.schema.w_sales_order_line_f AS A   -- ← SAME TABLE AS TARGET
+    INNER JOIN workspace.schema.wc_order_xref_ps AS B ON B.key = A.key
+) AS S ON T.sales_order_hd_id = S.sales_order_hd_id
+WHEN MATCHED AND T.x_quote_id = '0' THEN UPDATE SET T.x_quote_id = S.common;
+```
+
+```sql
+-- ✅ REQUIRED — pre-materialise the source into a temp view first
+-- Step 1: isolate the source data (no reference to the target table in this step)
+CREATE OR REPLACE TEMPORARY VIEW v_merge_source AS
+SELECT A.sales_order_hd_id, B.common
+FROM workspace.schema.w_sales_order_line_f AS A
+INNER JOIN workspace.schema.wc_order_xref_ps AS B ON B.key = A.key
+WHERE A.x_quote_id = '0';
+```
+```sql
+-- Step 2: MERGE using the temp view — no self-reference
+MERGE INTO workspace.schema.w_sales_order_line_f AS T
+USING v_merge_source AS S ON T.sales_order_hd_id = S.sales_order_hd_id
+WHEN MATCHED AND T.x_quote_id = '0' THEN UPDATE SET
+    T.x_quote_id  = S.common,
+    T.w_update_dt = current_timestamp();
+```
+
+**Detection rule:** Before writing any MERGE, check: does the USING subquery (at any nesting level) reference the same table as the MERGE target? If yes → create a `CREATE OR REPLACE TEMPORARY VIEW v_<task>_source AS …` cell first, then MERGE against that view.
+
+---
+
+### F.23 — Oracle implicit comma-join → explicit JOIN (cartesian product trap)
+
+**Error:** Silent wrong results — missing join condition produces a cross join.
+
+Oracle allowed implicit comma-join syntax: `FROM A, B, C WHERE A.x = B.y AND B.z = C.w`. When translating this to Spark SQL, every pair of tables **must** have an explicit `JOIN … ON` clause. If even one join condition is missed or misidentified, Spark silently produces a **cartesian product** (every row × every row) which inserts or updates millions of wrong rows.
+
+**The `ON 1 = 1` placeholder is FORBIDDEN** — it is a full cross join disguised as a join.
+
+```sql
+-- ❌ Oracle implicit comma-join
+INSERT INTO target
+SELECT DISTINCT C.value, SALES.row_wid
+FROM privacy_f C,
+     sales_order_f SALES,
+     contact_d CON,
+     person_d PER
+WHERE SALES.contact_wid = CON.row_wid
+  AND CON.person_wid = PER.row_wid
+  AND PER.integration_id = C.integration_id;
+```
+
+```sql
+-- ❌ FORBIDDEN Spark translation with placeholder — CROSS JOIN
+INSERT INTO workspace.schema.target
+SELECT DISTINCT C.value, SALES.row_wid
+FROM workspace.schema.privacy_f AS C
+INNER JOIN workspace.schema.sales_order_f AS SALES ON 1 = 1  -- ← CROSS JOIN
+INNER JOIN workspace.schema.contact_d AS CON ON SALES.contact_wid = CON.row_wid
+INNER JOIN workspace.schema.person_d AS PER ON CON.person_wid = PER.row_wid
+WHERE PER.integration_id = C.integration_id;  -- this is a JOIN condition, not a filter
+```
+
+```sql
+-- ✅ REQUIRED — every table pair has an explicit ON condition
+INSERT INTO workspace.schema.target
+SELECT DISTINCT C.value, SALES.row_wid
+FROM workspace.schema.sales_order_f AS SALES
+INNER JOIN workspace.schema.contact_d AS CON ON SALES.contact_wid = CON.row_wid
+INNER JOIN workspace.schema.person_d  AS PER ON CON.person_wid = PER.row_wid
+INNER JOIN workspace.schema.privacy_f AS C   ON PER.integration_id = C.integration_id;
+-- ↑ The WHERE predicate from Oracle becomes an ON condition for C
+```
+
+**Translation algorithm for Oracle comma-joins:**
+
+1. List all tables in the Oracle `FROM` clause (comma-separated).
+2. List all predicates in the `WHERE` clause.
+3. **Classify each predicate:**
+   - Predicate joins two different tables (`A.col = B.col`) → becomes `JOIN … ON`
+   - Predicate filters one table (`A.col = 'value'`) → stays in `WHERE`
+4. Build the explicit JOIN chain: start with the table that has the most direct filter predicates as the anchor, then JOIN each other table on its predicate.
+5. **NEVER leave any table pair without an explicit ON condition.** If you cannot identify the join condition, flag it as `-- TODO: join condition not found — MUST be resolved before running` and stop generation.
+
+**Mandatory self-check:** After translating any Oracle comma-join, scan your output for:
+- `ON 1 = 1` → **FORBIDDEN**, must be replaced with a real join predicate or generation must be stopped
+- `CROSS JOIN` → verify it is intentional (rare) and document why
+
+---
+
+### F.24 — Multiple DML statements in a single `%sql` cell
+
+**Error:** `ParseException: Expect end of query after first statement but found second DML keyword.`
+
+A Databricks `%sql` magic cell executes **exactly one SQL statement**. If a `BEGIN … END` block or sequential DML block from Oracle is translated into a single `%sql` cell containing two or more `MERGE`, `UPDATE`, `INSERT`, `DELETE`, or `TRUNCATE` statements, only the first statement executes (or Spark throws a parse error).
+
+```sql
+-- ❌ FORBIDDEN — two MERGE statements in one %sql cell
+-- MAGIC %sql
+MERGE INTO workspace.schema.target AS T USING ... WHEN MATCHED THEN UPDATE SET ...;
+
+MERGE INTO workspace.schema.target AS T USING ... WHEN MATCHED THEN UPDATE SET ...;
+-- ↑ Second MERGE never executes — ParseException or silent drop
+```
+
+```
+-- ✅ REQUIRED — each DML statement gets its own %sql cell
+```
+
+**Cell 1:**
+```sql
+-- MAGIC %sql
+-- SCEN_TASK_NO {X} [1/2]
+MERGE INTO workspace.schema.target AS T USING ... WHEN MATCHED THEN UPDATE SET ...;
+```
+
+**Cell 2:**
+```sql
+-- MAGIC %sql
+-- SCEN_TASK_NO {X} [2/2]
+MERGE INTO workspace.schema.target AS T USING ... WHEN MATCHED THEN UPDATE SET ...;
+```
+
+**Rule:** Count the DML statements inside every Oracle `BEGIN … END` block. If the block has N DML statements, create exactly N separate `%sql` cells. Label them `[1/N]`, `[2/N]` etc. in the cell comment header.
+
+Exception: `SET spark.databricks…` configuration statements may appear in the same cell as the DML they guard (e.g., the ZORDER stats guard). All other multi-statement blocks must be split.
+
+---
+
+### F.25 — MERGE INTO a SQL View
+
+**Error:** `DELTA_UNSUPPORTED_OPERATION: Cannot write to view '<view_name>'. Only Delta tables are supported.`
+
+Delta Lake cannot MERGE, UPDATE, INSERT, or DELETE against a SQL View. If the Oracle source performs DML against a view (typically because an `INSTEAD OF` trigger redirects it to the underlying tables), the Spark translation must target the underlying base Delta table directly.
+
+```sql
+-- ❌ FORBIDDEN
+MERGE INTO workspace.schema.vw_sales_order AS TARGET  -- vw_ prefix = view
+USING workspace.schema.staging AS STAGE ON ...
+WHEN MATCHED THEN UPDATE SET TARGET.col = STAGE.col;
+```
+
+```sql
+-- ✅ REQUIRED — target the base Delta table, document the substitution
+-- Note: Oracle DML targeted view vw_sales_order (INSTEAD OF trigger redirected to base table).
+-- Databricks equivalent: DML directly against the base Delta table.
+-- ACTION REQUIRED: Confirm base table name with data engineer before running.
+MERGE INTO workspace.schema.sales_order AS TARGET   -- ← base Delta table
+USING workspace.schema.staging AS STAGE ON ...
+WHEN MATCHED THEN UPDATE SET TARGET.col = STAGE.col;
+```
+
+**Detection rule:** Before writing any MERGE/UPDATE/INSERT/DELETE, check if the target table name:
+- Starts with `VW_` / `vw_` — almost certainly a view
+- Is prefixed with `V_` — may be a view
+- Does not have a corresponding `CREATE TABLE` elsewhere in the notebook
+
+If the target is a view → resolve to the base table, add an `-- ACTION REQUIRED` comment, and add a note in the notebook's Markdown cell. **Never silently target a view.**
+
+---
+
 ## 4. PL/SQL → Spark SQL Conversion Rules
 
 ### Rule 4.1 — NVL → COALESCE
@@ -886,12 +1063,31 @@ DECODE(col, v1, r1, v2, r2, default)
 CASE col WHEN v1 THEN r1 WHEN v2 THEN r2 ELSE default END
 ```
 
-### Rule 4.4 — SYSDATE / TRUNC(SYSDATE)
+### Rule 4.4 — SYSDATE / TRUNC(SYSDATE) / TO_DATE(SYSDATE, fmt)
 - `SYSDATE` → `current_date()`
 - `SYSTIMESTAMP` → `current_timestamp()`
 - `TRUNC(SYSDATE)` → `current_date()`
 - `SYSDATE - n` → `date_sub(current_date(), n)`
 - `SYSDATE + n` → `date_add(current_date(), n)`
+- **`TO_DATE(SYSDATE, 'fmt')` → `current_date()`** — Oracle developers sometimes wrap `SYSDATE` in `TO_DATE()` to strip the time component. In Spark, `to_date()` requires a STRING as its first argument, not a DATE or TIMESTAMP. Passing `current_timestamp()` (or `current_date()`) into `to_date(current_timestamp(), 'fmt')` produces a type error or NULL. Simply replace the whole expression with `current_date()`.
+
+```sql
+-- ❌ WRONG (type error in Spark — first arg must be STRING)
+to_date(current_timestamp(), 'dd-MMM-yyyy')
+
+-- ✅ CORRECT
+current_date()
+```
+
+- **`TO_TIMESTAMP(SYSDATE, 'fmt')` → `current_timestamp()`** — same rule applies. Do not pass a TIMESTAMP into `to_timestamp()`.
+
+```sql
+-- ❌ WRONG
+to_timestamp(current_date(), 'yyyy-MM-dd HH:mm:ss')
+
+-- ✅ CORRECT
+current_timestamp()
+```
 
 ### Rule 4.5 — SYS_GUID → uuid()
 `SYS_GUID()` → `uuid()` (only in safe positions — never in MERGE ON)
@@ -1232,7 +1428,40 @@ Use Databricks equivalents only when performance is confirmed to need it: `REPAR
 ### Rule 4.25 — TRUNCATE TABLE
 `TRUNCATE TABLE schema.table` → `TRUNCATE TABLE workspace.schema.table` ✓ (supported in Spark SQL)
 
-### Rule 4.26 — Autonomous transactions / nested commits → Standalone Python function
+### Rule 4.27 — `NOT IN (subquery)` NULL trap → `NOT EXISTS` or window function
+
+Oracle and Spark SQL both follow ANSI SQL: if a `NOT IN` subquery returns **any NULL value**, the entire predicate evaluates to `UNKNOWN` for every outer row — meaning **zero rows pass the filter**. This causes silent data loss (the DML statement runs but affects no rows).
+
+```sql
+-- ❌ DANGEROUS — if subquery returns any NULL row_wid, zero rows match
+WHERE row_wid NOT IN (SELECT row_wid FROM dedup_table WHERE ...)
+
+-- ✅ SAFE Option A — NOT EXISTS (NULL-safe)
+WHERE NOT EXISTS (
+    SELECT 1 FROM dedup_table d WHERE d.row_wid = outer.row_wid AND ...
+)
+
+-- ✅ SAFE Option B — window function dedup (preferred for deduplication patterns)
+FROM (
+    SELECT *, COUNT(1) OVER (PARTITION BY row_wid) AS cnt
+    FROM source_table
+)
+WHERE cnt = 1
+
+-- ✅ SAFE Option C — LEFT ANTI JOIN
+FROM source_table AS s
+LEFT ANTI JOIN (
+    SELECT row_wid FROM dedup_table GROUP BY row_wid HAVING COUNT(1) > 1
+) AS dups ON s.row_wid = dups.row_wid
+```
+
+**Rule:** NEVER translate Oracle `WHERE col NOT IN (SELECT col FROM …)` directly. Always check whether the subquery column is nullable. If nullable → use `NOT EXISTS` or window function. If the column has a `NOT NULL` constraint and you are certain it cannot be NULL → `NOT IN` is safe but add a comment: `-- SAFE: row_wid is NOT NULL (verified)`.
+
+**Special case — deduplication pattern:** The pattern `NOT IN (SELECT col FROM t GROUP BY col HAVING COUNT > 1)` is common for "keep only unique rows." The window function approach is cleaner and NULL-safe:
+```sql
+-- Replace: WHERE row_wid NOT IN (SELECT row_wid FROM t GROUP BY row_wid HAVING COUNT(1) > 1)
+-- With:
+FROM (SELECT *, COUNT(1) OVER (PARTITION BY row_wid) AS _cnt FROM t) WHERE _cnt = 1
 
 Oracle `PRAGMA AUTONOMOUS_TRANSACTION` allows a sub-procedure to open its own transaction, commit, and return to the caller's still-open transaction — typically used for audit logging that must persist even on caller rollback.
 
@@ -2891,6 +3120,40 @@ Checklist for this step:
 - [ ] Any `uuid()` or `rand()` that must appear in the result → pre-computed in a staging CTE or temp view column, then that column is referenced in the aggregate
 
 **Only after all 13 steps pass — output the notebook JSON.**
+
+---
+
+### Step 14 — Scan for comma-join, self-reference MERGE, multi-DML cells, view targets, and NOT IN NULL trap
+
+Search your entire output for these patterns before finalising:
+
+```
+ON 1 = 1          → FORBIDDEN — cross join placeholder; find the real join condition or stop
+ON 1=1            → same as above
+CROSS JOIN        → verify intentional; document if so
+```
+
+For every MERGE statement:
+- [ ] Does the USING subquery contain the same table name as the MERGE target? → **F.22 violation** — create temp view first
+- [ ] Did the USING subquery originate from Oracle comma-join syntax? → verify every table pair has a real `JOIN … ON` predicate, not `ON 1 = 1` → **F.23**
+
+For every `%sql` cell:
+- [ ] Count the DML-initiating keywords: `MERGE`, `UPDATE`, `INSERT`, `DELETE`, `TRUNCATE` (not counting SET config lines). Is the count > 1? → **F.24 violation** — split into separate cells
+
+For every MERGE / UPDATE / INSERT / DELETE target table:
+- [ ] Does the target name start with `VW_`, `vw_`, `V_`, or otherwise indicate a view? → **F.25 violation** — redirect to base Delta table
+
+For every `NOT IN (subquery)` predicate:
+- [ ] Is the subquery column declared `NOT NULL` in DDL? If not → **Rule 4.27 violation** — replace with `NOT EXISTS` or window function
+
+```
+to_date(current_timestamp()    → FORBIDDEN — type error; replace with current_date()
+to_date(current_date()         → FORBIDDEN — type error; replace with current_date()
+to_timestamp(current_date()    → FORBIDDEN — type error; replace with current_timestamp()
+to_timestamp(current_timestamp() → FORBIDDEN — type error; replace with current_timestamp()
+```
+
+**Only after all 14 steps pass — output the notebook JSON.**
 
 ---
 
