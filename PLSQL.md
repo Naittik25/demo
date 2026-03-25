@@ -23,7 +23,7 @@
 15. [Mandatory Self-Validation Before Output](#15-mandatory-self-validation-before-output)
 16. [Generic Conversion Example](#16-generic-conversion-example)
 
-**Forbidden Patterns covered:** F.1 PL/SQL procedural blocks · F.2 Explicit cursors · F.3 BULK COLLECT / FORALL · F.4 EXCEPTION blocks · F.5 EXECUTE IMMEDIATE dynamic SQL (+ SQL injection via USING) · F.6 Oracle pseudo-columns · F.7 Oracle functions (NVL, DECODE, etc.) · F.8 Correlated EXISTS in DELETE · F.9 Tuple-SET UPDATE · F.10 IDENTITY / SEQUENCE columns · F.11 Non-deterministic in MERGE ON · F.12 Timestamp format strings · F.13 PRAGMA directives · F.14 DBMS_* package calls · F.15 REF CURSOR · F.16 %TYPE / %ROWTYPE · F.17 Oracle DDL keywords · F.18 Multi-column IN predicate · F.19 PL/SQL Collection types (TABLE OF / VARRAY / INDEX BY) · F.20 FORALL SAVE EXCEPTIONS · F.21 Pipelined Functions (PIPE ROW / PIPELINED) · F.22 MERGE self-reference · F.23 Oracle implicit comma-join / cartesian trap · F.24 Multiple DML in one `%sql` cell · F.25 MERGE / DML into a SQL View · F.26 Row filter misplaced as JOIN ON predicate · F.27 Oracle NLS default timestamp string (VARCHAR2 → TIMESTAMP cast)
+**Forbidden Patterns covered:** F.1 PL/SQL procedural blocks · F.2 Explicit cursors · F.3 BULK COLLECT / FORALL · F.4 EXCEPTION blocks · F.5 EXECUTE IMMEDIATE dynamic SQL (+ SQL injection via USING) · F.6 Oracle pseudo-columns · F.7 Oracle functions (NVL, DECODE, etc.) · F.8 Correlated EXISTS in DELETE · F.9 Tuple-SET UPDATE · F.10 IDENTITY / SEQUENCE columns · F.11 Non-deterministic in MERGE ON · F.12 Timestamp format strings · F.13 PRAGMA directives · F.14 DBMS_* package calls · F.15 REF CURSOR · F.16 %TYPE / %ROWTYPE · F.17 Oracle DDL keywords · F.18 Multi-column IN predicate · F.19 PL/SQL Collection types (TABLE OF / VARRAY / INDEX BY) · F.20 FORALL SAVE EXCEPTIONS · F.21 Pipelined Functions (PIPE ROW / PIPELINED) · F.22 MERGE self-reference (target in USING subquery) · F.23 Oracle implicit comma-join / cartesian product trap · F.24 Multiple DML statements in one `%sql` cell · F.25 MERGE / DML into a SQL View · F.26 Row filter misplaced as JOIN ON predicate
 
 ---
 
@@ -95,8 +95,9 @@ Go through every item. If any item would be violated by your planned code, fix t
 - [ ] No MERGE / UPDATE / INSERT targeting a SQL view (`vw_` prefix) — use the underlying base Delta table (see F.25)
 - [ ] No `NOT IN (subquery)` where the subquery column is nullable — replace with `NOT EXISTS` or `COUNT() OVER (PARTITION BY …)` window dedup (see Rule 4.27)
 - [ ] No row filter predicate (`IS NULL`, `IS NOT NULL`, `col = 'literal'`, `col > value`) used as a `JOIN … ON` condition — single-table predicates always belong in `WHERE` (see F.26)
-- [ ] For every timestamp column read from a Delta table migrated from Oracle `VARCHAR2` — check whether the column stores Oracle NLS format strings (e.g., `23-MAR-26 12.00.06.746928000 PM`). If so, wrap every reference in `try_to_timestamp(col, 'dd-MMM-yy hh.mm.ss.SSSSSSSSS a')` before any comparison or date arithmetic (see F.27)
-- [ ] `etl_current_extract_time`, `w_insert_dt`, `w_update_dt`, `created_on_dt` — confirm these columns are stored as TIMESTAMP not STRING in the Delta table before using in WHERE/JOIN (see F.27)
+- [ ] No bare `{var}` brace syntax in `%sql` cells — use `${var}` Databricks widget syntax; `{var}` is Python f-string only (see Rule 4.28)
+- [ ] Every Oracle `CREATE BITMAP INDEX` or `CREATE INDEX` on a staging/temp table → translated to `OPTIMIZE … ZORDER BY (all indexed cols)` with stats guard; a `print()` alone is never acceptable (see Rule 4.29)
+- [ ] `SYSTIMESTAMP - n` comparisons against TIMESTAMP columns → `current_timestamp() - INTERVAL n DAYS` NOT `date_sub(current_timestamp(), n)` (see Rule 4.4)
 - [ ] No `SYS_CONNECT_BY_PATH` — replace with `concat_ws` accumulator column in recursive CTE (see Rule 4.13)
 - [ ] No `CONNECT BY NOCYCLE` — replace with `visited_ids NOT LIKE` cycle guard or depth limit `AND lvl < N` in recursive CTE (see Rule 4.13)
 - [ ] No non-deterministic function (`uuid()`, `rand()`, `monotonically_increasing_id()`) inside any aggregate argument (`COUNT`, `SUM`, `MAX`, `COLLECT_LIST`, etc.) — pre-compute in a staging CTE first (see Step 13)
@@ -1051,6 +1052,8 @@ If the target is a view → resolve to the base table, add an `-- ACTION REQUIRE
 
 ---
 
+---
+
 ### F.26 — Row filter condition misplaced as JOIN `ON` predicate
 
 **Error:** Silent wrong results — a `WHERE` filter placed inside a `JOIN … ON` clause becomes a cross join or explodes row count.
@@ -1073,159 +1076,36 @@ INNER JOIN workspace.schema.privacy_f AS C    ON CON.person_wid = C.person_wid
 WHERE SALES.x_email_opt_out IS NULL    -- ← correct position: row filter in WHERE
 ```
 
-**Classification test for every ON clause predicate:**
+**How to detect this error:** Before writing any `JOIN … ON` clause, test the predicate:
 
-| Test | Answer | Correct position |
-|------|--------|-----------------|
-| Predicate references columns from two different tables (`A.col = B.col`) | YES → valid join | `ON` clause |
-| Predicate references a column from only one table | YES → row filter | `WHERE` clause |
-| `col IS NULL` / `col IS NOT NULL` | Always single-table | `WHERE` clause |
-| `col = 'literal'` / `col > 0` | Always single-table | `WHERE` clause |
+| Test | Answer | Rule |
+|------|--------|------|
+| Does the predicate reference columns from **two different tables**? | YES → valid join predicate | Use in `ON` |
+| Does the predicate reference a column from **only one table**? | YES → row filter | Move to `WHERE` |
+| Is the predicate `col IS NULL` / `col IS NOT NULL`? | Always single-table | Always `WHERE` |
+| Is the predicate `col > value` / `col = 'literal'`? | Always single-table | Always `WHERE` |
+| Is the predicate `col1 = col2` where both cols are from the **same table**? | Single-table | `WHERE` |
 
-Forbidden single-table predicates in `ON`:
-```
-ON col IS NULL           → move to WHERE
-ON col IS NOT NULL       → move to WHERE
-ON col = 'literal'       → move to WHERE
-ON col > 0               → move to WHERE
-ON A.col = A.other_col   → same-table predicate, move to WHERE
-```
-
----
-
-### F.27 — Oracle NLS default timestamp string format in VARCHAR2 columns
-
-**Error:** `DateTimeException: [CAST_INVALID_INPUT] The value '23-MAR-26 12.00.06.746928000 PM' of the type "STRING" cannot be cast to "TIMESTAMP"`
-
-**Root cause — not in the SQL code, but in the source data:**
-
-Oracle commonly stores timestamps as `VARCHAR2` strings using the session's `NLS_TIMESTAMP_FORMAT`. The Oracle default is:
-
-```
-DD-MON-RR HH.MI.SSXFF AM
-```
-
-This produces values like: `23-MAR-26 12.00.06.746928000 PM`
-
-Three things make this format impossible for Spark to cast automatically:
-
-1. **Dot separators** — Oracle uses `.` between HH.MI.SS; Spark expects `:` in `HH:mm:ss`
-2. **2-digit year (RR)** — Oracle `RR` is a sliding-window 2-digit year; Spark `yy` is similar but not identical for dates near century boundaries
-3. **9-digit nanoseconds (FF9)** — Oracle `FF` = fractional seconds with 9 digits of precision; Spark's maximum via `SSSSSSSSS` is 9 digits but the `.` prefix must be explicit in the format string
-4. **12-hour clock with AM/PM** — requires `hh` (not `HH`) and `a` marker in Spark
-
-**When this error occurs in the notebook:**
-
-| Notebook cell type | What triggers it |
-|-------------------|-----------------|
-| `WHERE col >= current_timestamp() - INTERVAL N DAY` | Spark compares TIMESTAMP against a STRING column — auto-cast fails |
-| `CREATE TABLE … AS SELECT * FROM source` | Spark infers column type as STRING but downstream joins or filters expect TIMESTAMP |
-| `date_format(col, 'yyyyMMdd')` | Spark tries to interpret the STRING as a TIMESTAMP first |
-| `MAX(col)` aggregate on a timestamp-string column | String comparison instead of temporal comparison |
-
-**Fix — three patterns depending on the situation:**
-
-#### Pattern A — Column used only as a filter (most common case)
+**Common misplacements from Oracle comma-join translation:**
 
 ```sql
--- ❌ BROKEN — Spark tries to auto-cast the STRING column to TIMESTAMP, fails
-WHERE w_insert_dt >= current_timestamp() - INTERVAL '90' DAY
+-- ❌ These are ALL row filters — NEVER valid as JOIN ON conditions:
+ON SALES.x_email_opt_out IS NULL
+ON SALES.x_email_opt_out IS NOT NULL
+ON A.status = 'ACTIVE'
+ON B.amount > 0
+ON C.delete_flag = 'N'
+ON T.row_wid > '0'
+
+-- ✅ These are valid join predicates (two different tables):
+ON SALES.contact_wid = CON.row_wid
+ON CON.person_wid = PER.row_wid
+ON A.integration_id = B.integration_id
 ```
 
-```sql
--- ✅ REQUIRED — parse the Oracle NLS string explicitly with to_timestamp()
-WHERE to_timestamp(w_insert_dt, 'dd-MMM-yy hh.mm.ss.SSSSSSSSS a')
-    >= current_timestamp() - INTERVAL '90' DAY
-```
+**Rule:** When translating Oracle comma-joins, apply the classification algorithm from F.23 **strictly**. Any predicate that touches only one table belongs in `WHERE`. If you cannot find a two-table predicate to link a table pair → stop generation and flag `-- TODO: join condition not found between TABLE_A and TABLE_B — must be resolved`.
 
-If the fractional-second precision varies (6 or 9 digits), use `try_to_timestamp()` with the 9-digit format first, then fall back:
-
-```sql
-WHERE COALESCE(
-    try_to_timestamp(w_insert_dt, 'dd-MMM-yy hh.mm.ss.SSSSSSSSS a'),
-    try_to_timestamp(w_insert_dt, 'dd-MMM-yy hh.mm.ss.SSSSSS a'),
-    try_to_timestamp(w_insert_dt, 'dd-MMM-yy hh.mm.ss a')
-) >= current_timestamp() - INTERVAL '90' DAY
-```
-
-#### Pattern B — Column read via CTAS / CREATE TABLE AS SELECT
-
-When the source Oracle table has a `VARCHAR2` column containing timestamp strings and the notebook does `SELECT *`, the column arrives in Delta as `STRING`. Any downstream SQL that treats it as `TIMESTAMP` will fail.
-
-```sql
--- ❌ BROKEN — STRING column passes through, downstream operations fail
-CREATE OR REPLACE TABLE workspace.schema.staging USING DELTA AS
-SELECT * FROM workspace.schema.source_table;
-```
-
-```sql
--- ✅ REQUIRED — explicitly cast the Oracle-format column during CTAS
-CREATE OR REPLACE TABLE workspace.schema.staging USING DELTA AS
-SELECT
-    -- Cast Oracle NLS timestamp string to Spark TIMESTAMP during ingestion
-    COALESCE(
-        try_to_timestamp(w_insert_dt, 'dd-MMM-yy hh.mm.ss.SSSSSSSSS a'),
-        try_to_timestamp(w_insert_dt, 'dd-MMM-yy hh.mm.ss a')
-    ) AS w_insert_dt,
-    COALESCE(
-        try_to_timestamp(w_update_dt, 'dd-MMM-yy hh.mm.ss.SSSSSSSSS a'),
-        try_to_timestamp(w_update_dt, 'dd-MMM-yy hh.mm.ss a')
-    ) AS w_update_dt,
-    * EXCEPT (w_insert_dt, w_update_dt)
-FROM workspace.schema.source_table;
-```
-
-#### Pattern C — ETL watermark column read from a parameters table
-
-```sql
--- ❌ BROKEN — etl_current_extract_time is stored as Oracle NLS string
-CREATE OR REPLACE TEMPORARY VIEW v_etl_current_extract_time AS
-SELECT MAX(etl_current_extract_time) AS etl_current_extract_time
-FROM workspace.prxbi_dw.wc_etl_parameters
-WHERE etl_job_type = 'EOD';
--- Then used as: AND w_update_dt > (SELECT etl_current_extract_time - INTERVAL '1' DAY …)
--- FAILS if etl_current_extract_time is stored as VARCHAR2 '23-MAR-26 12.00.06.746928000 PM'
-```
-
-```sql
--- ✅ REQUIRED — parse at the point of reading the parameter
-CREATE OR REPLACE TEMPORARY VIEW v_etl_current_extract_time AS
-SELECT COALESCE(
-    try_to_timestamp(MAX(etl_current_extract_time), 'dd-MMM-yy hh.mm.ss.SSSSSSSSS a'),
-    try_to_timestamp(MAX(etl_current_extract_time), 'dd-MMM-yy hh.mm.ss a'),
-    try_to_timestamp(MAX(etl_current_extract_time), 'yyyy-MM-dd HH:mm:ss')
-) AS etl_current_extract_time
-FROM workspace.prxbi_dw.wc_etl_parameters
-WHERE etl_job_type = 'EOD';
-```
-
-**Full Oracle NLS default timestamp format → Spark mapping:**
-
-| Oracle NLS element | Example value | Spark format token | Notes |
-|-------------------|--------------|-------------------|-------|
-| `DD` | `23` | `dd` | Day of month |
-| `-` | `-` | `-` | Literal separator |
-| `MON` | `MAR` | `MMM` | Abbreviated month name |
-| `-` | `-` | `-` | |
-| `RR` | `26` | `yy` | 2-digit sliding year |
-| ` ` | ` ` | ` ` | Space separator |
-| `HH` | `12` | `hh` | 12-hour clock (lowercase) |
-| `.` | `.` | `.` | Dot separator — not colon |
-| `MI` | `00` | `mm` | Minutes |
-| `.` | `.` | `.` | Dot separator |
-| `SS` | `06` | `ss` | Seconds |
-| `.` | `.` | `.` | Dot before fractional |
-| `FF9` | `746928000` | `SSSSSSSSS` | 9-digit nanoseconds |
-| ` ` | ` ` | ` ` | Space |
-| `AM` | `PM` | `a` | AM/PM marker |
-
-**Complete format string:** `'dd-MMM-yy hh.mm.ss.SSSSSSSSS a'`
-
-**Detection rule:** Before writing any `WHERE col >= timestamp_expr`, `date_format(col, …)`, or `CAST(col AS TIMESTAMP)`, check whether `col` is stored as `STRING` in the Delta table. If the underlying Oracle column was `VARCHAR2` containing timestamp values, it must be parsed explicitly with `try_to_timestamp()` using the Oracle NLS format. Never rely on Spark's implicit STRING→TIMESTAMP auto-cast.
-
-**Pre-generation checklist addition:**
-- [ ] For every timestamp column read from a Delta table that was migrated from Oracle VARCHAR2 — confirm the column is stored as TIMESTAMP type. If stored as STRING (Oracle VARCHAR2), wrap every reference in `try_to_timestamp(col, 'dd-MMM-yy hh.mm.ss.SSSSSSSSS a')` before any date arithmetic or comparison.
-- [ ] Never assume Oracle `DATE`/`TIMESTAMP`/`VARCHAR2` columns migrate cleanly to Spark `TIMESTAMP` — inspect the actual stored values or the source DDL.
+**Mandatory self-check added to Step 14:** After every comma-join translation, scan every `JOIN … ON` clause for single-table predicates (`IS NULL`, `IS NOT NULL`, comparisons to literals, comparisons between columns of the same table). If found → move to `WHERE`.
 
 ---
 
@@ -1244,12 +1124,35 @@ DECODE(col, v1, r1, v2, r2, default)
 CASE col WHEN v1 THEN r1 WHEN v2 THEN r2 ELSE default END
 ```
 
-### Rule 4.4 — SYSDATE / TRUNC(SYSDATE) / TO_DATE(SYSDATE, fmt)
+### Rule 4.4 — SYSDATE / TRUNC(SYSDATE) / TO_DATE(SYSDATE, fmt) / SYSTIMESTAMP arithmetic
 - `SYSDATE` → `current_date()`
 - `SYSTIMESTAMP` → `current_timestamp()`
 - `TRUNC(SYSDATE)` → `current_date()`
-- `SYSDATE - n` → `date_sub(current_date(), n)`
-- `SYSDATE + n` → `date_add(current_date(), n)`
+- `SYSDATE - n` → `date_sub(current_date(), n)` *(DATE arithmetic — result is DATE)*
+- `SYSDATE + n` → `date_add(current_date(), n)` *(DATE arithmetic — result is DATE)*
+- **`SYSTIMESTAMP - n`** → `current_timestamp() - INTERVAL n DAYS` *(TIMESTAMP arithmetic — preserves time component)*
+- **`SYSTIMESTAMP + n`** → `current_timestamp() + INTERVAL n DAYS`
+
+**⚠ Critical distinction — `date_sub` truncates to DATE, INTERVAL preserves TIMESTAMP:**
+
+```sql
+-- Oracle: sysdate - 90          → date result (no time component)
+-- Oracle: systimestamp - 90     → timestamp result (preserves time HH:MM:SS)
+
+-- ❌ WRONG for TIMESTAMP columns — date_sub truncates time to midnight
+WHERE w_update_dt > date_sub(current_timestamp(), 90)
+-- Compares TIMESTAMP column against midnight of (today - 90 days)
+-- Rows updated between midnight and now on that boundary date are excluded
+
+-- ✅ CORRECT for TIMESTAMP columns — INTERVAL preserves full timestamp precision
+WHERE w_update_dt > current_timestamp() - INTERVAL 90 DAYS
+```
+
+**Decision rule:**
+- Source column/expression is **DATE** type → `date_sub(current_date(), n)` / `date_add(current_date(), n)`
+- Source column/expression is **TIMESTAMP** type → `current_timestamp() - INTERVAL n DAYS`
+- When in doubt → use `INTERVAL` — it works correctly for both DATE and TIMESTAMP comparisons
+
 - **`TO_DATE(SYSDATE, 'fmt')` → `current_date()`** — Oracle developers sometimes wrap `SYSDATE` in `TO_DATE()` to strip the time component. In Spark, `to_date()` requires a STRING as its first argument, not a DATE or TIMESTAMP. Passing `current_timestamp()` (or `current_date()`) into `to_date(current_timestamp(), 'fmt')` produces a type error or NULL. Simply replace the whole expression with `current_date()`.
 
 ```sql
@@ -1643,6 +1546,107 @@ LEFT ANTI JOIN (
 -- Replace: WHERE row_wid NOT IN (SELECT row_wid FROM t GROUP BY row_wid HAVING COUNT(1) > 1)
 -- With:
 FROM (SELECT *, COUNT(1) OVER (PARTITION BY row_wid) AS _cnt FROM t) WHERE _cnt = 1
+```
+
+---
+
+### Rule 4.28 — Widget variable reference syntax: `${var}` in `%sql`, `{var}` in Python
+
+**Error:** `ParseException: extraneous input '{' expecting ...` in `%sql` cells.
+
+Databricks uses **two different variable interpolation syntaxes** depending on cell type:
+
+| Cell type | Syntax | Example |
+|-----------|--------|---------|
+| `%sql` magic cell | `${widget_name}` — dollar-brace | `date_sub(current_date(), ${v_prune_days})` |
+| Python cell | `{variable}` — f-string brace | `f"date_sub(current_date(), {v_prune_days})"` |
+
+Using Python f-string brace syntax `{var}` inside a `%sql` cell is **not interpolated** — Spark SQL sees a literal `{` character and throws a parse error.
+
+```sql
+-- ❌ FORBIDDEN in %sql cell — Python f-string syntax not valid
+-- MAGIC %sql
+WHERE w_insert_dt >= date_sub(current_date(), {v_non_cots_prune_days})
+-- ParseException: extraneous input '{' expecting ...
+```
+
+```sql
+-- ✅ REQUIRED in %sql cell — Databricks widget syntax
+-- MAGIC %sql
+WHERE w_insert_dt >= date_sub(current_date(), ${v_non_cots_prune_days})
+```
+
+```python
+# ✅ CORRECT in Python cell — f-string syntax
+spark.sql(f"""
+    WHERE w_insert_dt >= date_sub(current_date(), {v_non_cots_prune_days})
+""")
+```
+
+**Applies to:** Any place a runtime parameter appears in a `%sql` cell — `WHERE` clauses, `LIMIT`, `INTERVAL` expressions, `CASE` values, string literals. Scan every `%sql` cell for bare `{…}` patterns and replace with `${…}`.
+
+**Also applies to INTERVAL expressions:**
+```sql
+-- ❌ FORBIDDEN
+WHERE w_insert_dt >= current_date() - INTERVAL '{v_days}' DAY
+
+-- ✅ REQUIRED
+WHERE w_insert_dt >= current_date() - INTERVAL '${v_days}' DAY
+-- OR — compute in Python cell first and embed as literal:
+-- Python: days = int(dbutils.widgets.get("v_days"))
+-- Then use:  WHERE w_insert_dt >= current_date() - INTERVAL '{days}' DAY
+```
+
+---
+
+### Rule 4.29 — Oracle bitmap indexes → `OPTIMIZE … ZORDER BY`
+
+**Error:** Silent performance regression — bitmap indexes not translated means no file-level skipping in Delta queries.
+
+Oracle bitmap indexes are used on low-cardinality columns in fact tables to accelerate multi-column filter queries. Delta Lake has no bitmap index concept. The **Databricks equivalent** is `OPTIMIZE … ZORDER BY`, which co-locates related data in the same files using Z-order space-filling curves, enabling file-level skipping.
+
+```sql
+-- ❌ FORBIDDEN — dropping bitmap indexes with no replacement
+BEGIN
+    EXECUTE IMMEDIATE 'create bitmap index TEMP_M1 on W_TEMP(SALES_REP_WID)';
+    EXECUTE IMMEDIATE 'create bitmap index TEMP_M2 on W_TEMP(ORDER_STATUS_WID)';
+    EXECUTE IMMEDIATE 'create bitmap index TEMP_M3 on W_TEMP(DOC_CURR_CODE)';
+END;
+```
+
+```python
+# ❌ WRONG — silently dropping indexes with a print statement
+print("Oracle bitmap index creation statements are not applicable and have been removed.")
+# This leaves no performance equivalent. Queries will full-scan.
+```
+
+```sql
+-- ✅ REQUIRED — convert ALL bitmap-indexed columns into a single ZORDER BY
+-- One OPTIMIZE covers all columns — Delta does not support per-column optimization calls
+-- MAGIC %sql
+SET spark.databricks.delta.optimize.zorder.checkStatsCollection.enabled = false;
+OPTIMIZE workspace.schema.w_temp
+ZORDER BY (
+    sales_rep_wid,
+    order_status_wid,
+    doc_curr_code
+    -- add ALL columns that had bitmap indexes
+);
+```
+
+**Translation rules:**
+
+| Oracle | Databricks |
+|--------|-----------|
+| N separate `EXECUTE IMMEDIATE 'CREATE BITMAP INDEX …'` statements | One `OPTIMIZE … ZORDER BY (col1, col2, …)` cell |
+| Each bitmap-indexed column | Listed in the `ZORDER BY` clause |
+| `CREATE INDEX … ON table(col)` (B-tree) | `OPTIMIZE … ZORDER BY (col)` if the col is a query filter; otherwise omit |
+| Index on a staging/temp table | Run OPTIMIZE **after** the table is populated, **before** the first query against it |
+| `DROP INDEX` | No action needed — Delta manages its own file layout |
+
+**Placement rule:** The OPTIMIZE cell must appear **after** the `CREATE TABLE … AS SELECT` or the last bulk INSERT into the table, and **before** the first MERGE/SELECT that filters on the ZORDER columns. For staging tables, this is typically right after the CTAS and before the first downstream MERGE.
+
+**Mandatory self-check:** Any time the source contains `CREATE BITMAP INDEX` or `CREATE INDEX … ON staging_table`, the output **must** contain a corresponding `OPTIMIZE … ZORDER BY` cell. A `print()` statement alone is never an acceptable translation of an index.
 
 Oracle `PRAGMA AUTONOMOUS_TRANSACTION` allows a sub-procedure to open its own transaction, commit, and return to the caller's still-open transaction — typically used for audit logging that must persist even on caller rollback.
 
@@ -1812,7 +1816,6 @@ except Exception as e:
 3. **Case sensitivity in Spark**: `yyyy` ≠ `YYYY` in Spark. Oracle is case-insensitive; Spark is not.
 4. **Quoted literals**: Oracle uses `"T"` for literal T in format strings. Spark uses `'T'`. In Python strings, nest carefully: `"yyyy-MM-dd'T'HH:mm:ss"` (outer double-quotes, inner single-quotes).
 5. **`MON` locale**: `MMM` in Spark uses the JVM locale. On Databricks, the default is `en-US`. If your data has non-English month abbreviations, set `spark.conf.set("spark.sql.session.timeZone", "UTC")` and pre-translate month names.
-6. **Oracle NLS default `VARCHAR2` timestamp strings**: Oracle stores timestamps in `VARCHAR2` columns using `NLS_TIMESTAMP_FORMAT`, which defaults to `DD-MON-RR HH.MI.SSXFF AM` (e.g., `23-MAR-26 12.00.06.746928000 PM`). This format uses **dot separators** (`HH.MI.SS` not `HH:MI:SS`), a **2-digit year** (`RR`), **9-digit nanoseconds** (`FF9`), and a **12-hour clock with AM/PM**. Spark cannot auto-cast this — it must be parsed explicitly. Use `try_to_timestamp(col, 'dd-MMM-yy hh.mm.ss.SSSSSSSSS a')`. See **F.27** for the full pattern.
 
 ---
 
@@ -3328,21 +3331,43 @@ For every MERGE / UPDATE / INSERT / DELETE target table:
 For every `NOT IN (subquery)` predicate:
 - [ ] Is the subquery column declared `NOT NULL` in DDL? If not → **Rule 4.27 violation** — replace with `NOT EXISTS` or window function
 
-For every column comparison involving a potential Oracle-migrated timestamp:
-- [ ] Is the column type in the Delta table `STRING` (migrated from Oracle `VARCHAR2`)? → **F.27 violation** — wrap in `try_to_timestamp(col, 'dd-MMM-yy hh.mm.ss.SSSSSSSSS a')`
-- [ ] Columns to check specifically: `w_insert_dt`, `w_update_dt`, `etl_current_extract_time`, `created_on_dt`, any column compared to `current_timestamp()` or `INTERVAL`
-
-```
-CAST(varchar2_col AS TIMESTAMP)                  → FORBIDDEN if col contains Oracle NLS format
-col >= current_timestamp() - INTERVAL N DAYS     → check col type first; if STRING → try_to_timestamp()
-date_format(varchar2_col, 'yyyyMMdd')            → wrap in try_to_timestamp() first
-```
-
 ```
 to_date(current_timestamp()    → FORBIDDEN — type error; replace with current_date()
 to_date(current_date()         → FORBIDDEN — type error; replace with current_date()
 to_timestamp(current_date()    → FORBIDDEN — type error; replace with current_timestamp()
 to_timestamp(current_timestamp() → FORBIDDEN — type error; replace with current_timestamp()
+```
+
+For every `JOIN … ON` clause (after any comma-join translation):
+- [ ] Does every `ON` predicate reference columns from **two different tables**? → single-table predicates (`IS NULL`, `IS NOT NULL`, `= 'literal'`, `> value`) in an `ON` clause → **F.26 violation** — move to `WHERE`
+
+```
+ON col IS NULL           → FORBIDDEN — row filter, move to WHERE
+ON col IS NOT NULL       → FORBIDDEN — row filter, move to WHERE
+ON col = 'literal'       → FORBIDDEN — row filter, move to WHERE
+ON col > 0               → FORBIDDEN — row filter, move to WHERE
+ON A.col = A.other_col   → FORBIDDEN — same-table predicate, move to WHERE
+```
+
+For every `%sql` cell that references a widget or Python variable:
+- [ ] Variable references use `${widget_name}` syntax (not `{variable}` Python braces) → **Rule 4.28**
+
+```
+{v_any_name}   in a %sql cell → FORBIDDEN — ParseException; must be ${v_any_name}
+```
+
+For every Oracle `EXECUTE IMMEDIATE 'CREATE BITMAP INDEX …'` or `CREATE INDEX … ON table(col)`:
+- [ ] Is there a corresponding `OPTIMIZE … ZORDER BY (col, …)` cell in the output? → if only a `print()` statement exists with no OPTIMIZE → **Rule 4.29 violation**
+
+```
+print("Oracle bitmap index ... removed")   with NO OPTIMIZE cell → INCOMPLETE
+```
+
+For every `SYSTIMESTAMP - n` or `sysdate - n` where the compared column is a TIMESTAMP:
+- [ ] Is `date_sub(current_timestamp(), n)` used? → **Rule 4.4 violation** — replace with `current_timestamp() - INTERVAL n DAYS`
+
+```
+date_sub(current_timestamp(), n)  → WARNING — truncates to DATE; use INTERVAL for TIMESTAMP columns
 ```
 
 **Only after all 14 steps pass — output the notebook JSON.**
